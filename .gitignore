@@ -1,0 +1,15 @@
+# Build artifacts
+*.prg
+*.map
+*.o
+host_test/harness
+host_test/harness.exe
+
+# Test output dumps
+bitmap.bin
+sprblock.bin
+sprites.txt
+sprite_sheet.bin
+
+# Generated headers (committed for deterministic builds)
+# airports.h and sincos.h are committed; their generators are also tracked.

@@ -1,65 +1,44 @@
-# C64U Radar
+# C64U Radar — C64 side
 
-C64 Ultimate ADS-B radar scope. This source tree contains no baked-in
-coordinates or LAN address — the compiled server address starts at `0.0.0.0`
-and the user always picks a real center on the C64.
+C64 ADS-B radar scope using **Meatloaf HTTPS** directly to adsb.fi.
+No Python server, no Ultimate Cartridge UCI registers needed.
 
-The visible menu is:
+## Menu
 
 ```text
-C64U RADAR V0.1
+C64U RADAR V0.2
 Choose an option to center your scope:
 1. CENTER ON LAT/LONG
 2. CENTER ON ICAO AIRPORT CODE
 ```
 
-The version string is on the main menu title only — the bitmap scope
-screen's own title has no room for it (14-character column). Bump
-`VERSION_STRING` in `c64u_radar.c` for future releases.
+- **Option 1** — enter signed decimal latitude/longitude (e.g. `51.4775` `-0.4614`).
+- **Option 2** — enter a 4-letter ICAO airport code (e.g. `EGLL` for Heathrow).
+  The code is resolved from a built-in table of ~280 major airports.
 
-Users choose a latitude/longitude or four-letter ICAO airport center. There is
-no numbered menu option for the server IP; the address normally fills itself
-in. While the menu idles, the program watches a mailbox at `$8AC0` that the
-Python server fills over the C64 Ultimate REST API (see
-`../server/README.md`), and the menu shows one of three states:
+The C64 opens a Meatloaf full-mode HTTP connection to `opendata.adsb.fi/api/v3`
+and extracts aircraft fields via JSON Pointer commands.  No PC helper needed.
 
-- `SEARCHING FOR SERVER...` — no mailbox value adopted yet.
-- `AUTO DISCOVERED SERVER AT:` — the server found and pushed its address.
-- `USER ENTERED SERVER IP:` — the user overrode it manually (below).
-
-Pressing Commodore+S (`C= + S`) opens manual IP entry. A manually entered
-address is sticky for the rest of the run: it is mirrored into the mailbox,
-but the program stops auto-adopting further server pushes until the next
-relaunch/reset, so a background server on a different address can't silently
-overwrite a deliberate manual choice. Either way — pushed or manually
-entered — the address survives reset/relaunch, because the mailbox lives in
-RAM outside the loaded program and is only lost on power-off.
-
-Mailbox layout at `$8AC0` (23 bytes): `MR2M` magic, version 1, IP length,
-16-byte IP text field, XOR checksum (seed `$A5`). The program only adopts a
-mailbox IP whose checksum validates and which parses as dotted IPv4.
-
-The Commodore+S hotkey is detected by scanning the KERNAL's own keyboard
-decode tables at `$EB81` (unshifted) and `$EC03` (Commodore) at startup for
-the physical S key, rather than hardcoding a PETSCII byte for the
-Commodore-modified key. `POKE 657,128` disables the KERNAL's automatic
-SHIFT+Commodore charset toggle, since Commodore is now an application hotkey
-modifier and the program owns a fixed lowercase/uppercase charset choice.
-
-Build with cc65 on `PATH`:
+## Build
 
 ```sh
-make clean all
+make clean all        # requires cc65 on PATH
+make host_test        # builds native harness (no C64 needed)
 ```
 
-Output: `c64u_radar.prg`. The build fails if program/data reaches the fixed
-sprite block at `$5A00`.
+Output: `c64u_radar.prg`.  Build fails if program/data reaches the fixed
+sprite block at `$5A00` (checked by `check_map.py`).
 
-Run the native harness from `host_test/` with:
+## Memory layout
 
-```sh
-cc -DHOST_TEST -I. -I.. -o harness harness.c
-./harness
-```
+Upper RAM worksheet:
+- `$8000` charset copy (2 KB)
+- `$8800` rowbase (100 B)
+- `$8900` blob buffer (232 B)
+- `$8A00` URL buffer (96 B)
+- `$8A60` scope labels (32 B)
+- `$8A80` JSON Pointer scratch (32 B)
+- `$8AC0` JSON value buffer (36 B)
 
-The companion Python server lives in this repo's `server/` folder.
+The old `$8AC0` mailbox (`MR2M` magic, server-address push) is no longer used
+— the adsb.fi URL is always built from user input.

@@ -1,16 +1,19 @@
 /* ==========================================================================
- * C64U RADAR -- public ADS-B scope for the Commodore 64 Ultimate
+ * C64U RADAR -- public ADS-B scope for the Commodore 64
  *
- * Companion to the standalone C64 Ultimate Radar Python server. The server
- * TLS, JSON, trig and projection; this program opens one TCP socket per
- * poll through the Ultimate Command Interface network target, reads a
- * <=232-byte fixed-width blob, and moves sprites.
+ * Direct HTTPS to adsb.fi OpenData API v3 via Meatloaf IEC device.
+ * No Python server, no Ultimate-II+ UCI registers needed.
  *
- *   feed:   connect FEED_HOST:6464, optionally send MR2 location request,
- *           then read until remote close
- *   blob:   8-byte header "LD",ver,flags,count,total,age,0
- *           + count * 28-byte records (see ldv_c64_feed.py docstring)
- *   text fields arrive as C64 screen codes -- blitted straight to bitmap
+ *   feed:   opens an HTTPS connection to opendata.adsb.fi, issues GET
+ *           /api/v3/lat/.../lon/.../dist/..., and extracts JSON fields
+ *           through Meatloaf's built-in JSON Pointer ("j") command.
+ *   blob:   builds the in-memory LD wire format so render_targets()
+ *           can stamp sprites and the side panel unchanged.
+ *
+ * Hardware requirements:
+ *   - Commodore 64
+ *   - Meatloaf (or compatible IEC device with full-mode HTTP + TLS)
+ *   - Device 8, secondary address 2 (read-write full HTTP mode)
  *
  * Display: hires bitmap 320x200, VIC bank 1
  *   $5A00-$5BFF eight independent 64-byte sprite patterns
@@ -20,19 +23,12 @@
  *   scope = left 200x200 px, center (100,100), 9nm ring r=95
  *   table = char columns 26..39
  *
- * Build:  make            (cl65 -t c64, vendored ultimateii-dos-lib, GPL-3)
- * Run:    select the PRG in the Ultimate file browser and run it
- * Needs:  "Command Interface" enabled in the Ultimate menu, and the C64U
- *         on the same LAN as the server computer. The startup menu can
- *         replace the initial FEED_HOST value without rebuilding.
- *
- * Known v1 limits: no sweep animation, no dead reckoning between polls
- * (track/gs bytes are already in the record for it), blips are all one
- * color until the feed starts banding altitudes.
+ * Build:  make            (cl65 -t c64)
  * ========================================================================== */
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include <peekpoke.h>
 #ifndef HOST_TEST
@@ -40,15 +36,18 @@
 #include <c64.h>
 #include <cbm.h>
 #endif
-#include "ultimate_lib.h"
+#include "sincos.h"
+#include "airports.h"
 
 /* ---- configuration ------------------------------------------------------ */
-#define FEED_HOST   "0.0.0.0"         /* public build requires menu setup   */
-#define FEED_PORT   6464
-#define POLL_JIF    600               /* 10 s between polls (jiffies)       */
-#define REPLY_JIF   1200              /* 20 s: first new location may fetch */
-#define VERSION_STRING "V0.1"         /* main menu only; scope title has no
-                                          room for it (14-char column)      */
+#define ADSB_BASE       "https://opendata.adsb.fi/api/v3"
+#define DEFAULT_RANGE   9                   /* nautical miles                  */
+#define POLL_JIF        600                 /* 10 s between polls (jiffies)   */
+#define REPLY_JIF       1200                /* 20 s network timeout            */
+#define VERSION_STRING  "V0.2"
+#define ML_CH           2                   /* Meatloaf logical channel        */
+#define ML_DEV          8                   /* Meatloaf IEC device number      */
+#define ML_SA           2                   /* secondary address = full mode   */
 
 /* ---- video map ----------------------------------------------------------- */
 #define MATRIX      0x5C00
@@ -68,18 +67,11 @@
 #define MAGIC1      0x44              /* 'D' */
 #define REC_SZ      28
 #define MAX_AC      8
-#define FEED_REQ_SZ 48
-#define BLOB_SZ     (8 + MAX_AC * REC_SZ)
 
 /* link states */
 enum { ST_OK, ST_STALE, ST_DOWN, ST_BAD, ST_WAIT, ST_LOCATION, ST_EXIT };
 
-/* main-menu server-address label: where the current feed_host came from */
-enum { SERVER_UNSET, SERVER_AUTO, SERVER_MANUAL };
-
-/* Host-test hook: build with -DHOST_TEST (see host_test/) to compile the
- * drawing/parsing logic natively against a fake 64K RAM and render a
- * pixel-true preview PNG. The C64 build is the #else path, unchanged.   */
+/* Host-test hook: build with -DHOST_TEST (see host_test/)                */
 #ifdef HOST_TEST
 unsigned char host_ram[65536];
 #  define MEM(a) (host_ram + (a))
@@ -90,112 +82,176 @@ unsigned char host_ram[65536];
 static unsigned char* const bmp = MEM(BITMAP);
 static unsigned char* const mtx = MEM(MATRIX);
 
-/* Upper RAM workspace. Keeping it out of the loaded program leaves the
- * fixed $5A00 sprite block untouched as menu/network features grow.        */
+/* Upper RAM workspace                                                       */
 static unsigned char* const charset = MEM(0x8000);
 static unsigned int* const rowbase = (unsigned int*)MEM(0x8800);
 static const unsigned char bmask[8] =
     { 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01 };
 
+/* Blob buffer (LD wire format, max 232 bytes) at 0x8900                    */
 static unsigned char* const blob = MEM(0x8900);
-static unsigned char sock;
-static char* const feed_request = (char*)MEM(0x8A00);
-static char* const feed_host = (char*)MEM(0x8A30);
-static char* const scope_label1 = (char*)MEM(0x8A40);
-static char* const scope_label2 = (char*)MEM(0x8A50);
+
+/* URL buffer at 0x8A00 (max 96 bytes for adsb.fi v3 URL).  Used only during
+ * cbm_open(); after the connection opens its content is dead and the space
+ * is free to reuse.                                                          */
+static char* const url_buf = (char*)MEM(0x8A00);
+
+/* Display labels — live for the duration of the scope loop, must not overlap
+ * url_buf.  Placed at +0x60 to leave url_buf a full 96-byte safety margin.   */
+static char* const scope_label1 = (char*)MEM(0x8A60);
+static char* const scope_label2 = (char*)MEM(0x8A70);
+
+/* JSON value read buffer size (must match j_val area below)                */
+#define JVAL_SZ 36
+
+/* JSON Pointer construction + response buffers (only used inside fetch())
+ * j_ptr at $8A80 fits "/ac/15/alt_baro\0" (max ~18 bytes for 2-digit idx).
+ * j_val at $8AC0 (32 bytes, fits any single JSON field the API returns).   */
+static char* const j_ptr = (char*)MEM(0x8A80);
+static char* const j_val = (char*)MEM(0x8AC0);
+
 static unsigned char link_down_displayed;
+static unsigned char current_range = DEFAULT_RANGE;
 
-/* Server-address mailbox shared with the radar Python server through the
- * Ultimate REST API (machine:readmem / machine:writemem). The server only
- * writes offsets +5..+22 and only after verifying the magic, so it can never
- * touch a machine that is not running this program. The block also survives
- * reset/relaunch, which restores the last IP without the server.
- *   +0..3 magic "MR2M" (ASCII bytes, kept numeric: cc65 letter literals are
- *   PETSCII)  +4 version  +5 ip length  +6..21 ip text  +22 checksum        */
-#define MAILBOX_ADDR 0x8AC0
-static unsigned char* const mailbox = MEM(MAILBOX_ADDR);
-static unsigned char server_source;      /* SERVER_UNSET/AUTO/MANUAL        */
-static unsigned char cs_hotkey;          /* raw byte for Commodore+S, or 0  */
-
-static unsigned char set_feed_host(const char* text);
-static unsigned char find_commodore_key(unsigned char unshifted_code);
-
-static unsigned char mailbox_checksum(void)
+/* ---- ASCII → screen-code (from original -- these are PETSCII-safe) ------ */
+static unsigned char asc2sc(char c)
 {
-    unsigned char sum = 0xA5, i, len = mailbox[5];
-    sum ^= len;
-    for (i = 0; i < len && i < 15; ++i) sum ^= mailbox[6 + i];
-    return sum;
+    unsigned char o = (unsigned char)c;
+    if (o >= 0xC1 && o <= 0xDA) return o & 0x1F;
+    if (o >= 0x41 && o <= 0x5A) return o - 0x40;
+    if (o >= 0x61 && o <= 0x7A) return o - 0x60;
+    if (o >= 0x20 && o <= 0x3F) return o;
+    return 46;                                    /* '.' */
 }
 
-static unsigned char mailbox_magic_ok(void)
+/* ==========================================================================
+ * string helpers (no reliance on large stdlib routines)
+ * ========================================================================== */
+
+static void str_cpy(char* dst, const char* src, unsigned char maxlen)
 {
-    return mailbox[0] == 0x4D && mailbox[1] == 0x52 &&
-           mailbox[2] == 0x32 && mailbox[3] == 0x4D && mailbox[4] == 1;
+    unsigned char i = 0;
+    while (*src && i < maxlen - 1) { dst[i++] = *src++; }
+    dst[i] = 0;
 }
 
-/* Mirror the active server IP so the server sees the radar running and the
- * address survives reset.                                                   */
-static void mailbox_store(const char* ip)
+/* ---------------------------------------------------------------------------
+ * adsb.fi JSON field extraction via Meatloaf "j" commands
+ *
+ * After "m get" + "s" is sent, the response is buffered inside Meatloaf.
+ * Each "j /path" command extracts one field from the cached JSON without
+ * re-fetching the URL. We read the result byte-by-byte until EOI.
+ * ---------------------------------------------------------------------------
+ */
+
+/* Read one response value into buf (max len-1 chars, NUL-terminated).
+ * Returns 1 on success (at least one byte read), 0 on EOI/error.          */
+static unsigned char ml_read_val(unsigned char ch, char* buf,
+                                 unsigned char maxlen)
 {
-    unsigned char i, len = (unsigned char)strlen(ip);
-    mailbox[0] = 0x4D; mailbox[1] = 0x52;
-    mailbox[2] = 0x32; mailbox[3] = 0x4D;
-    mailbox[4] = 1;
-    mailbox[5] = len;
-    for (i = 0; i < 16; ++i)
-        mailbox[6 + i] = i < len ? (unsigned char)ip[i] : 0;
-    mailbox[22] = mailbox_checksum();
+    unsigned char i = 0;
+    while (i < maxlen - 1) {
+        if (cbm_read(ch, (unsigned char*)(buf + i), 1) == 0) break;
+        if (buf[i] == '\r' || buf[i] == '\n') break;
+        ++i;
+    }
+    buf[i] = 0;
+    return i > 0;
 }
 
-/* Adopt a valid mailbox IP that differs from the active one. Returns 1 when
- * feed_host changed. Torn server writes fail the checksum and are skipped.
- * A manually entered address is sticky for the rest of this run: the server
- * would otherwise re-push its own address over the user's deliberate choice
- * every poll cycle.                                                        */
-static unsigned char mailbox_poll(void)
+/* Query a JSON Pointer and read the result as a string into buf.
+ * Returns 1 on success, 0 if the field is absent.                         */
+static unsigned char j_str(unsigned char ch, const char* pointer,
+                           char* buf, unsigned char maxlen)
 {
-    char ip[16];
-    unsigned char i, len = mailbox[5];
-    if (server_source == SERVER_MANUAL) return 0;
-    if (!mailbox_magic_ok()) return 0;
-    if (len < 7 || len > 15) return 0;
-    if (mailbox[22] != mailbox_checksum()) return 0;
-    for (i = 0; i < len; ++i) ip[i] = (char)mailbox[6 + i];
-    ip[len] = 0;
-    if (!strcmp(ip, feed_host)) return 0;
-    if (!set_feed_host(ip)) return 0;
-    server_source = SERVER_AUTO;
+    cbm_write(ch, "j ", 2);
+    cbm_write(ch, pointer, (unsigned char)strlen(pointer));
+    cbm_write(ch, "\r\n", 2);
+    return ml_read_val(ch, buf, maxlen);
+}
+
+/* Query a JSON Pointer and read the result as an integer.
+ * Returns 1 on success, 0 on missing field.                               */
+static unsigned char j_int(unsigned char ch, const char* pointer, int* val)
+{
+    char buf[20];
+    if (!j_str(ch, pointer, buf, sizeof(buf))) return 0;
+    *val = atoi(buf);
     return 1;
 }
 
-static void init_config(void)
+/* Parse a decimal string in tenths (e.g. "4.5" → 45).
+ * Returns 1 on success, 0 on parse failure.                                */
+static unsigned char parse_tenths(const char* s, int* out)
 {
-    strcpy(feed_host, FEED_HOST);
-    feed_request[0] = 0;
-    scope_label1[0] = 0;
-    scope_label2[0] = 0;
-    /* A mailbox that survived reset restores the last server IP (mailbox_poll
-       sets server_source = SERVER_AUTO on success); otherwise plant a fresh
-       mailbox so the server knows the radar is running.                    */
-    if (!mailbox_poll())
-        mailbox_store(feed_host);
-    /* 0x53 is the numeric low-PETSCII code the KERNAL reports for the
-       unshifted S key -- NOT the char literal 'S', which cc65 compiles to
-       high PETSCII for on-screen display and would never match here. */
-    cs_hotkey = find_commodore_key(0x53);
-    POKE(0x0291, 128);   /* disable the SHIFT+Commodore charset toggle:    */
-                         /* C=+S is now an app hotkey, not a display switch */
+    int val = 0, frac = 0, sign = 1;
+    if (!s || !*s) return 0;
+    if (*s == '-') { sign = -1; ++s; }
+    if (*s == '+') { ++s; }
+    if (!(*s >= '0' && *s <= '9')) return 0;
+    while (*s >= '0' && *s <= '9') {
+        val = val * 10 + (*s - '0');
+        ++s;
+    }
+    if (*s == '.') {
+        ++s;
+        if (*s >= '0' && *s <= '9') { frac = *s - '0'; ++s; }
+    }
+    if (*s) return 0;
+    *out = sign * (val * 10 + frac);
+    return 1;
+}
+
+/* Check if a string equals "ground" (case-insensitive)                     */
+static unsigned char is_ground(const char* s)
+{
+    return (s[0] == 'g' || s[0] == 'G') &&
+           (s[1] == 'r' || s[1] == 'R') &&
+           (s[2] == 'o' || s[2] == 'O') &&
+           (s[3] == 'u' || s[3] == 'U') &&
+           (s[4] == 'n' || s[4] == 'N') &&
+           (s[5] == 'd' || s[5] == 'D') && !s[6];
+}
+
+/* Validate 4-letter ICAO code */ /* (basic range check — used at compile time) */
+static unsigned char is_icao(const char* code)
+{
+    unsigned char i;
+    for (i = 0; i < 4; ++i)
+        if (code[i] < 'A' || code[i] > 'Z') return 0;
+    return code[4] == 0;
+}
+
+/* Pack 4-char ICAO code into uint32 big-endian                             */
+static unsigned long code_to_u32(const char* code)
+{
+    return ((unsigned long)(unsigned char)code[0] << 24) |
+           ((unsigned long)(unsigned char)code[1] << 16) |
+           ((unsigned long)(unsigned char)code[2] <<  8) |
+            (unsigned long)(unsigned char)code[3];
+}
+
+/* Binary-search the airport table for an ICAO code.
+ * Returns 1 and sets lat/lon on success.                                   */
+static unsigned char find_airport(const char* code,
+                                  int32_t* lat, int32_t* lon)
+{
+    unsigned long target = code_to_u32(code);
+    int lo = 0, hi = AIRPORT_COUNT - 1, mid;
+    while (lo <= hi) {
+        mid = (lo + hi) >> 1;
+        if (airports[mid].code < target)      lo = mid + 1;
+        else if (airports[mid].code > target) hi = mid - 1;
+        else { *lat = airports[mid].lat; *lon = airports[mid].lon; return 1; }
+    }
+    return 0;
 }
 
 /* ==========================================================================
  * startup location request
  * ========================================================================== */
 
-
-/* Validate a decimal coordinate without linking the C64 floating-point
- * library. Values at the exact pole/date-line limit may only have zeroes
- * after the decimal point.                                                  */
+/* Validate a decimal coordinate without linking the C64 floating-point lib */
 static unsigned char valid_coordinate(const char* text, unsigned int limit)
 {
     unsigned int whole = 0;
@@ -220,89 +276,57 @@ static unsigned char valid_coordinate(const char* text, unsigned int limit)
     return whole < limit || (whole == limit && !frac_nonzero);
 }
 
+/* Set lat/lon from user-entered coordinates.  Builds the URL for adsb.fi. */
 static unsigned char set_position_request(const char* latitude,
                                           const char* longitude)
 {
     if (!valid_coordinate(latitude, 90) || !valid_coordinate(longitude, 180))
         return 0;
-    if (strlen(latitude) + strlen(longitude) + 13 > FEED_REQ_SZ)
-        return 0;
-    /* Lowercase source letters compile to the ASCII-compatible PETSCII
-       bytes required by the network protocol. */
-    sprintf(feed_request, "mr2 pos %s %s 9\n", latitude, longitude);
-    strncpy(scope_label1, latitude, 14); scope_label1[14] = 0;
-    strncpy(scope_label2, longitude, 14); scope_label2[14] = 0;
+    /* Build adsb.fi v3 URL */
+    sprintf(url_buf, "%s/lat/%s/lon/%s/dist/%d",
+            ADSB_BASE, latitude, longitude, current_range + 1);
+    str_cpy(scope_label1, latitude, 14);
+    str_cpy(scope_label2, longitude, 14);
     return 1;
 }
 
+/* Set lat/lon from ICAO airport code lookup.                              */
 static unsigned char set_icao_request(const char* code)
 {
-    unsigned char i;
-    if (strlen(code) != 4) return 0;
-    for (i = 0; i < 4; ++i)
-        if (code[i] < 'A' || code[i] > 'Z') return 0;
-    sprintf(feed_request, "mr2 icao %c%c%c%c 9\n",
-            code[0] & 0x7F, code[1] & 0x7F,
-            code[2] & 0x7F, code[3] & 0x7F);
-    strcpy(scope_label1, code);
+    int32_t icao_lat, icao_lon;
+    char lat_str[16], lon_str[16];
+    unsigned char neg;
+    if (!is_icao(code)) return 0;
+    if (!find_airport(code, &icao_lat, &icao_lon)) return 0;
+    /* Convert integer micro-degrees back to signed decimal text */
+    neg = icao_lat < 0;
+    if (neg) icao_lat = -icao_lat;
+    sprintf(lat_str, "%s%ld.%06ld",
+            neg ? "-" : "",
+            (long)(icao_lat / 1000000),
+            (long)(icao_lat % 1000000));
+    neg = icao_lon < 0;
+    if (neg) icao_lon = -icao_lon;
+    sprintf(lon_str, "%s%ld.%06ld",
+            neg ? "-" : "",
+            (long)(icao_lon / 1000000),
+            (long)(icao_lon % 1000000));
+    sprintf(url_buf, "%s/lat/%s/lon/%s/dist/%d",
+            ADSB_BASE, lat_str, lon_str, current_range + 1);
+    str_cpy(scope_label1, code, 14);
     scope_label2[0] = 0;
-    return 1;
-}
-
-static unsigned char set_feed_host(const char* text)
-{
-    unsigned char groups = 0, digits = 0;
-    unsigned int value = 0;
-    const char* p = text;
-    for (;;) {
-        if (*p >= '0' && *p <= '9') {
-            if (++digits > 3) return 0;
-            value = value * 10 + (unsigned int)(*p++ - '0');
-            if (value > 255) return 0;
-        } else if (*p == '.' || !*p) {
-            if (!digits || ++groups > 4) return 0;
-            if (!*p) break;
-            digits = 0; value = 0; ++p;
-        } else return 0;
-    }
-    if (groups != 4 || strlen(text) > 15) return 0;
-    strcpy(feed_host, text);
     return 1;
 }
 
 static unsigned char key_to_petscii(unsigned char c)
 {
-    /* KERNAL keyboard input uses low PETSCII for unshifted letters, while
-       cc65 uppercase C literals use high PETSCII. Normalize to the latter. */
     if (c >= 0x41 && c <= 0x5A) c |= 0x80;
     else if (c >= 0x61 && c <= 0x7A)
         c = (unsigned char)((c - 0x20) | 0x80);
     return c;
 }
 
-/* KERNAL ROM is banked in at $E000-$FFFF by default (this program never
- * hides it, unlike the brief CHAREN toggle in copy_charset()), so its fixed
- * keyboard decode tables can be read directly instead of guessing a byte
- * value for a modified key. Locate the physical key whose *unshifted* code
- * is `unshifted_code` in the $EB81 table, then return the same key's entry
- * in the $EC03 Commodore-key table. This works across KERNAL ROM revisions.
- * The lookup is a plain PEEK scan, so it also runs correctly against the
- * harness's fake RAM when a test plants matching bytes there.               */
-#define KEYTAB_UNSHIFT   0xEB81
-#define KEYTAB_COMMODORE 0xEC03
-#define KEYTAB_KEYS      64
-static unsigned char find_commodore_key(unsigned char unshifted_code)
-{
-    unsigned char i;
-    for (i = 0; i < KEYTAB_KEYS; ++i)
-        if (PEEK(KEYTAB_UNSHIFT + i) == unshifted_code)
-            return PEEK(KEYTAB_COMMODORE + i);
-    return 0;
-}
-
 #ifndef HOST_TEST
-/* The menu uses the lowercase/uppercase character set. cc65's high-PETSCII
- * uppercase and low-PETSCII lowercase literals therefore display directly. */
 static void menu_putsxy(unsigned char x, unsigned char y, const char* text)
 {
     unsigned char c;
@@ -342,35 +366,14 @@ static unsigned char read_input(char* result, unsigned char maximum)
     return length;
 }
 
-/* Draw whichever of the three server-address states currently applies.
- * Label and value sit on separate rows because "AUTO DISCOVERED SERVER AT:"
- * plus a worst-case 15-character IP would overflow the 40-column screen and
- * wrap onto the next line if crammed onto one.                             */
-static void draw_server_status(void)
-{
-    switch (server_source) {
-        case SERVER_MANUAL:
-            menu_putsxy(4, 12, "USER ENTERED SERVER IP:");
-            menu_putsxy(4, 13, feed_host);
-            break;
-        case SERVER_AUTO:
-            menu_putsxy(4, 12, "Auto discovered server at:");
-            menu_putsxy(4, 13, feed_host);
-            break;
-        default:
-            menu_putsxy(4, 12, "SEARCHING FOR SERVER...");
-            break;
-    }
-}
-
 static void setup_location(void)
 {
-    char latitude[17], longitude[17], icao[5], address[16];
-    unsigned char choice, raw;
+    char latitude[17], longitude[17], icao[5];
+    unsigned char choice;
     textcolor(COLOR_LIGHTGREEN);
     bgcolor(COLOR_BLACK);
     bordercolor(COLOR_BLACK);
-    feed_request[0] = 0;
+    url_buf[0] = 0;
     scope_label1[0] = 0;
     scope_label2[0] = 0;
 
@@ -380,40 +383,14 @@ static void setup_location(void)
         menu_putsxy(1, 4, "Choose an option to center your scope:");
         menu_putsxy(4, 6, "1. CENTER ON LAT/LONG");
         menu_putsxy(4, 8, "2. CENTER ON ICAO AIRPORT CODE");
-        draw_server_status();
-        menu_putsxy(4, 15, "C= + S CHANGES SERVER ADDRESS");
-        menu_putsxy(6, 20, "Traffic data source: adsb.fi");
+        menu_putsxy(6, 14, "Traffic data source: adsb.fi");
+        menu_putsxy(6, 15, "via Meatloaf HTTPS");
         menu_putsxy(13, 23, "levimaaia.com");
         menu_putsxy(9, 24, "youtube.com/@levimaaia");
-        /* Wait for a key while watching the mailbox: the server pushes its
-           IP through the Ultimate REST API while this menu idles. The raw
-           byte is checked against the Commodore+S hotkey before any PETSCII
-           normalization, since normalizing could shift it into a different
-           code and hide the match.                                         */
-        raw = 0;
-        for (;;) {
-            if (kbhit()) { raw = (unsigned char)cgetc(); break; }
-            if (mailbox_poll()) break;    /* redraw with the new server line */
-        }
-        if (!raw) continue;
 
-        if (cs_hotkey && raw == cs_hotkey) {
-            clrscr();
-            menu_putsxy(6, 4, "ENTER SERVER IP ADDRESS");
-            menu_putsxy(4, 8, "IP: ");
-            read_input(address, 15);
-            if (set_feed_host(address)) {
-                server_source = SERVER_MANUAL;
-                mailbox_store(feed_host);
-            } else {
-                menu_putsxy(8, 12, "INVALID IP ADDRESS");
-                menu_putsxy(8, 14, "PRESS A KEY");
-                cgetc();
-            }
-            continue;
-        }
+        choice = (unsigned char)cgetc();
+        choice = key_to_petscii(choice);
 
-        choice = key_to_petscii(raw);
         if (choice == '1' || choice == 'P') {
             clrscr();
             menu_putsxy(7, 1, "ENTER LATITUDE / LONGITUDE");
@@ -446,7 +423,7 @@ static void setup_location(void)
 }
 #endif
 
-/* 3x5 digit masks for 1..8. The bits are cut out of a solid diamond.      */
+/* 3x5 digit masks for 1..8 (unchanged)                                      */
 static const unsigned char digit_rows[8][5] = {
     { 2, 6, 2, 2, 7 },
     { 7, 1, 7, 4, 7 },
@@ -458,13 +435,11 @@ static const unsigned char digit_rows[8][5] = {
     { 7, 5, 7, 5, 7 }
 };
 
-/* Stem endpoints for N, NE, E, SE, S, SW, W, NW. Each direction exposes
- * five pixels beyond the radius-five diamond.                              */
 static const unsigned char dir_x[8] = { 11, 18, 21, 18, 11, 4, 1, 4 };
 static const unsigned char dir_y[8] = {  0,  3, 10, 17, 20,17,10, 3 };
 
 /* ==========================================================================
- * low-level drawing
+ * low-level drawing (unchanged from original)
  * ========================================================================== */
 
 static void plot(int x, int y)
@@ -485,8 +460,6 @@ static void vline(int y0, int y1, int x)
     for (y = y0; y <= y1; ++y) plot(x, y);
 }
 
-
-/* Sprite-local drawing. A pattern is 3 bytes x 21 rows plus byte 63.      */
 static void spr_plot(unsigned char* p, unsigned char x, unsigned char y)
 {
     if (x < 24 && y < 21)
@@ -515,8 +488,6 @@ static void spr_line(unsigned char* p, int x0, int y0, int x1, int y1)
     }
 }
 
-/* Build one numbered marker. Track-byte sectors are 32 units (45 degrees),
- * rounded to the nearest of the eight compass directions.                 */
 static void build_sprite(unsigned char slot, unsigned char track,
                          unsigned char track_unknown)
 {
@@ -529,14 +500,12 @@ static void build_sprite(unsigned char slot, unsigned char track,
         spr_line(p, 11, 10, dir_x[sector], dir_y[sector]);
     }
 
-    /* Solid radius-five diamond centered at the target position. */
     for (y = 5; y <= 15; ++y) {
         half = (unsigned char)(5 - (y > 10 ? y - 10 : 10 - y));
         for (x = (unsigned char)(11 - half); x <= (unsigned char)(11 + half); ++x)
             spr_plot(p, x, y);
     }
 
-    /* Cut the target number out in black for CRT-readable contrast. */
     for (y = 0; y < 5; ++y) {
         row = digit_rows[slot][y];
         for (x = 0; x < 3; ++x)
@@ -559,7 +528,6 @@ static void circle(int cx, int cy, int r)
     }
 }
 
-/* blit screen-code glyphs into the bitmap at char cell (col,row)           */
 static void draw_sc(unsigned char col, unsigned char row,
                     const unsigned char* sc, unsigned char len)
 {
@@ -573,8 +541,6 @@ static void draw_sc(unsigned char col, unsigned char row,
     }
 }
 
-/* One reverse-video screen-code cell in bitmap mode: green field, black
- * glyph. There is no VIC reverse flag in hires bitmap mode.                */
 static void draw_sc_reverse(unsigned char col, unsigned char row,
                             unsigned char sc)
 {
@@ -584,17 +550,6 @@ static void draw_sc_reverse(unsigned char col, unsigned char row,
     for (k = 0; k < 8; ++k) dst[k] = (unsigned char)~g[k];
 }
 
-static unsigned char asc2sc(char c)
-{
-    unsigned char o = (unsigned char)c;
-    if (o >= 0xC1 && o <= 0xDA) return o & 0x1F;
-    if (o >= 0x41 && o <= 0x5A) return o - 0x40;
-    if (o >= 0x61 && o <= 0x7A) return o - 0x60;
-    if (o >= 0x20 && o <= 0x3F) return o;
-    return 46;                                    /* '.' */
-}
-
-/* draw PETSCII/ASCII text, space-padded to `width` screen-code cells       */
 static void draw_ascii(unsigned char col, unsigned char row,
                        const char* s, unsigned char width)
 {
@@ -629,17 +584,50 @@ static void draw_reverse_ascii(unsigned char col, unsigned char row,
 }
 
 /* ==========================================================================
- * display setup
+ * projection: polar (dst NM, dir degrees) → pixel (x, y)
  * ========================================================================== */
 
-#ifndef HOST_TEST   /* host harness loads the chargen ROM file instead */
+/* Convert (dst_tenths, dir_degrees, range_nm) to 0..199 pixel coords.
+ * Uses fixed-point lookup tables for sin/cos (scaled by 127).             */
+static void project(int dst_tenths, unsigned int dir,
+                    unsigned int range_nm,
+                    unsigned char* out_x, unsigned char* out_y)
+{
+    int pixel_dist, dx, dy, x, y;
+
+    /* pixel_dist = (dst_nm / range_nm) * SCOPE_RADIUS_PX
+     * dst_nm = dst_tenths / 10,  so:
+     * pixel_dist = dst_tenths * SCOPE_RADIUS_PX / (range_nm * 10)         */
+    if (range_nm == 0) range_nm = 1;
+    pixel_dist = (dst_tenths * RING_PX) / ((int)range_nm * 10);
+    if (pixel_dist > 199) pixel_dist = 199;
+
+    dir %= 360;
+    dx = (pixel_dist * (int)sin127[dir]) / 127;
+    dy = (pixel_dist * (int)cos127[dir]) / 127;
+
+    x = SCOPE_C + dx;
+    y = SCOPE_C - dy;             /* screen Y axis is inverted             */
+
+    if (x < 0) x = 0;  if (x > 199) x = 199;
+    if (y < 0) y = 0;  if (y > 199) y = 199;
+
+    *out_x = (unsigned char)x;
+    *out_y = (unsigned char)y;
+}
+
+/* ==========================================================================
+ * display setup (unchanged)
+ * ========================================================================== */
+
+#ifndef HOST_TEST
 static void copy_charset(void)
 {
     unsigned char p;
     __asm__("sei");
     p = PEEK(0x0001);
-    POKE(0x0001, p & 0xFB);                       /* char ROM in at $D000  */
-    memcpy(charset, (void*)0xD000, 2048);         /* uppercase/gfx set     */
+    POKE(0x0001, p & 0xFB);
+    memcpy(charset, (void*)0xD000, 2048);
     POKE(0x0001, p);
     __asm__("cli");
 }
@@ -670,7 +658,7 @@ static void init_sprites(void)
         POKE(MATRIX + 0x3F8 + i, SPR_PTRVAL + i);
         POKE(0xD027 + i, SPR_GREEN);
     }
-    POKE(0xD015, 0);                              /* all off until data    */
+    POKE(0xD015, 0);
     POKE(0xD010, 0); POKE(0xD017, 0); POKE(0xD01D, 0);
     POKE(0xD01B, 0); POKE(0xD01C, 0);
 }
@@ -679,7 +667,6 @@ static void draw_static_scope(void)
 {
     static const unsigned char lbl3 = 0x33, lbl6 = 0x36, lbl9 = 0x39;
 
-    /* bezel + rings (3/6/9 nm) + center cross */
     hline(0, 199, 0);  hline(0, 199, 199);
     vline(0, 199, 0);  vline(0, 199, 199);
     circle(SCOPE_C, SCOPE_C, 32);
@@ -687,17 +674,15 @@ static void draw_static_scope(void)
     circle(SCOPE_C, SCOPE_C, RING_PX);
     hline(98, 102, 100); vline(98, 102, 100);
 
-    /* ring labels just right of 12 o'clock, like the panel */
     draw_sc(13, 8, &lbl3, 1);
     draw_sc(13, 4, &lbl6, 1);
     draw_sc(13, 0, &lbl9, 1);
 
-    /* right column chrome */
     draw_centered(TBL_COL, 0, "C64U RADAR", TBL_W);
     memset(bmp + rowbase[1] + (TBL_COL << 3), 0, TBL_W * 8);
     {
         unsigned char bar[TBL_W];
-        memset(bar, 0x40, TBL_W);                 /* horizontal line char  */
+        memset(bar, 0x40, TBL_W);
         draw_sc(TBL_COL, 1, bar, TBL_W);
         draw_sc(TBL_COL, 20, bar, TBL_W);
     }
@@ -705,7 +690,7 @@ static void draw_static_scope(void)
 }
 
 /* ==========================================================================
- * table + sprites from a parsed blob
+ * table + sprites from the in-memory LD blob
  * ========================================================================== */
 
 static void show_status(unsigned char st)
@@ -750,30 +735,28 @@ static void render_targets(void)
     else sprintf(tmp, "IN RANGE %3u", total);
     draw_ascii(TBL_COL, 22, tmp, TBL_W);
 
-    /* Keep the previous frame visible while positions/patterns are updated. */
     for (i = 0; i < count; ++i) {
         r = blob + 8 + (unsigned int)i * REC_SZ;
         x = r[0]; y = r[1];
         build_sprite(i, r[4], r[3] & 0x04);
-        POKE(0xD000 + (i << 1), 24 + x - 11);     /* center local 11,10    */
+        POKE(0xD000 + (i << 1), 24 + x - 11);
         POKE(0xD001 + (i << 1), 50 + y - 10);
         POKE(0xD027 + i, SPR_GREEN);
     }
     POKE(0xD015, count ? (unsigned char)((1 << count) - 1) : 0);
 
-    /* table rows: two per target */
     for (i = 0; i < MAX_AC; ++i) {
         memset(lineA, 0x20, TBL_W);
         memset(lineB, 0x20, TBL_W);
         if (i < count) {
             r = blob + 8 + (unsigned int)i * REC_SZ;
-            lineA[0] = (unsigned char)('1' + i);  /* sprite/list number    */
-            memcpy(lineA + 1,  r + 6, 8);         /* callsign              */
-            memcpy(lineA + 10, r + 14, 4);        /* type, col 9 is space  */
-            memcpy(lineB + 1,  r + 18, 5);        /* alt                   */
-            memcpy(lineB + 7,  r + 23, 4);        /* gs                    */
-            lineB[11] = 0x0B;                     /* K                     */
-            lineB[12] = 0x14;                     /* T                     */
+            lineA[0] = (unsigned char)('1' + i);
+            memcpy(lineA + 1,  r + 6, 8);
+            memcpy(lineA + 10, r + 14, 4);
+            memcpy(lineB + 1,  r + 18, 5);
+            memcpy(lineB + 7,  r + 23, 4);
+            lineB[11] = 0x0B;                     /* K */
+            lineB[12] = 0x14;                     /* T */
         } else if (i == 0) {
             draw_ascii(TBL_COL, 4, "NO TRAFFIC", TBL_W);
             draw_sc(TBL_COL, 5, lineB, TBL_W);
@@ -787,60 +770,161 @@ static void render_targets(void)
 }
 
 /* ==========================================================================
- * network
+ * adsb.fi data fetch via Meatloaf HTTPS
  * ========================================================================== */
-
-/* read until the server closes (return 0) or we have the whole blob.
- * uii_socketread: 0 = closed, -1 = nothing yet, >0 = bytes at uii_data[2] */
-static int read_blob(void)
-{
-    unsigned int total = 0, needed = 8;
-    int n;
-    clock_t t0 = clock();
-
-    while (total < needed) {
-#ifndef HOST_TEST
-        if (kbhit() && (unsigned char)cgetc() == CH_F1) return -3;
-#endif
-        n = uii_socketread(sock, 512);
-        if (n == 0) break;
-        if (n > 0) {
-            if (total + n > BLOB_SZ) n = BLOB_SZ - total;
-            if (n > 0) {
-                memcpy(blob + total, uii_data + 2, (size_t)n);
-                total += n;
-            }
-            if (total >= 8) {
-                if (blob[0] != MAGIC0 || blob[1] != MAGIC1 || blob[4] > MAX_AC)
-                    return -2;
-                needed = 8 + (unsigned int)blob[4] * REC_SZ;
-            }
-        }
-        if ((unsigned int)(clock() - t0) > REPLY_JIF) return -1;
-    }
-    return (total >= needed) ? (int)total : -1;
-}
 
 static unsigned char fetch(void)
 {
-    int r;
-    sock = uii_tcpconnect(feed_host, FEED_PORT);
-    if (!uii_success()) return ST_DOWN;
-    if (feed_request[0]) {
-        uii_socketwrite(sock, feed_request);
-        if (!uii_success()) {
-            uii_socketclose(sock);
-            return ST_DOWN;
-        }
+    unsigned char ch = ML_CH;
+    int total, i, dst_tenths, dir_int, alt_val, gs_val, track_val;
+    int http_status;
+    char alt_str[6], gs_str[5];
+    unsigned char px, py, flags, track_byte, speed_byte;
+    unsigned char valid_count = 0, j;
+
+    /* ---- open Meatloaf connection ---- */
+    if (cbm_open(ch, ML_DEV, ML_SA, url_buf) != 0) {
+        return ST_DOWN;
     }
-    r = read_blob();
-    uii_socketclose(sock);
-    if (r == -3) return ST_EXIT;
-    if (r == -2) return ST_BAD;
-    if (r < 0)  return ST_DOWN;
-    if (blob[3] & 0x04) return ST_LOCATION;
+
+    /* ---- build and send the GET request ---- */
+    cbm_write(ch, "h user-agent: c64u-radar/1.0\r\n", 31);
+    cbm_write(ch, "m get\r\n", 7);
+    cbm_write(ch, "s\r\n", 3);
+
+    /* ---- check HTTP response status ---- */
+    cbm_write(ch, "status\r\n", 8);
+    if (!ml_read_val(ch, j_val, JVAL_SZ)) {
+        cbm_close(ch); return ST_DOWN;
+    }
+    http_status = atoi(j_val);
+    if (http_status != 200) {
+        cbm_close(ch);
+        return (http_status == -1 || http_status == -2) ? ST_DOWN : ST_BAD;
+    }
+
+    /* ---- total aircraft count ---- */
+    if (!j_int(ch, "/total", &total)) {
+        cbm_close(ch); return ST_BAD;
+    }
+    if (total <= 0) total = 0;
+    if (total > MAX_AC) total = MAX_AC;
+
+    blob[0] = MAGIC0; blob[1] = MAGIC1;
+    blob[2] = 1;      /* wire version */
+    blob[3] = 0;      /* flags: 0x01=stale 0x02=truncated 0x04=loc_error */
+    blob[4] = 0;      /* count -- set after extraction */
+    blob[5] = 0;      /* total (unused without server) */
+    blob[6] = 0;      /* age */
+    blob[7] = 0;
+
+    /* ---- extract each aircraft via JSON Pointer ---- */
+    for (i = 0; i < total; ++i) {
+        unsigned char* r = blob + 8 + (unsigned int)valid_count * REC_SZ;
+
+        /* dst (nautical miles, in tenths) */
+        sprintf(j_ptr, "/ac/%d/dst", i);
+        if (!j_str(ch, j_ptr, j_val, JVAL_SZ) ||
+            !parse_tenths(j_val, &dst_tenths)) {
+            continue;   /* skip missing/invalid aircraft */
+        }
+
+        /* dir (bearing from center, degrees true) */
+        sprintf(j_ptr, "/ac/%d/dir", i);
+        if (!j_int(ch, j_ptr, &dir_int)) continue;
+        dir_int %= 360;
+        if (dir_int < 0) dir_int += 360;
+
+        /* project dst+dir to 0..199 pixel coordinates */
+        project(dst_tenths, (unsigned int)dir_int, current_range, &px, &py);
+        r[0] = px;
+        r[1] = py;
+        r[2] = 3;                     /* blip color (reserved) */
+
+        flags = 0;
+
+        /* track heading (degrees, folded to 0..359) */
+        sprintf(j_ptr, "/ac/%d/track", i);
+        if (j_int(ch, j_ptr, &track_val)) {
+            track_byte = (unsigned char)(((track_val % 360) * 256u) / 360);
+        } else {
+            flags |= 0x04;
+            track_byte = 0;
+        }
+        r[3] = flags;
+        r[4] = track_byte;
+        r[5] = 0;
+
+        /* ground speed (knots, clamped to 0..255) */
+        sprintf(j_ptr, "/ac/%d/gs", i);
+        if (j_int(ch, j_ptr, &gs_val) && gs_val >= 0) {
+            speed_byte = (gs_val > 255) ? 255 : (unsigned char)gs_val;
+            sprintf(gs_str, "%4d", (gs_val > 9999) ? 9999 : gs_val);
+        } else {
+            flags |= 0x02;
+            speed_byte = 0;
+            gs_str[0] = '-'; gs_str[1] = '-';
+            gs_str[2] = ' '; gs_str[3] = ' ';
+            gs_str[4] = 0;
+        }
+        r[5] = speed_byte;
+
+        /* altitude (feet, or "ground", or missing) */
+        sprintf(j_ptr, "/ac/%d/alt_baro", i);
+        if (!j_str(ch, j_ptr, j_val, JVAL_SZ)) {
+            flags |= 0x01;
+            alt_str[0] = '-'; alt_str[1] = '-';
+            alt_str[2] = ' '; alt_str[3] = ' ';
+            alt_str[4] = ' '; alt_str[5] = 0;
+        } else if (is_ground(j_val)) {
+            flags |= 0x01;
+            alt_str[0] = 'G'; alt_str[1] = 'N'; alt_str[2] = 'D';
+            alt_str[3] = ' '; alt_str[4] = ' '; alt_str[5] = 0;
+        } else {
+            alt_val = atoi(j_val);
+            if (alt_val >= 18000)
+                sprintf(alt_str, "FL%03d", alt_val / 100);
+            else
+                sprintf(alt_str, "%5d", alt_val);
+        }
+        r[3] = flags;
+
+        /* callsign (8 chars, space-padded, converted to screen code) */
+        sprintf(j_ptr, "/ac/%d/flight", i);
+        if (!j_str(ch, j_ptr, j_val, JVAL_SZ)) {
+            for (j = 0; j < 8; ++j) r[6 + j] = 0x20;
+        } else {
+            for (j = 0; j < 8; ++j)
+                r[6 + j] = j_val[j] ? asc2sc(j_val[j]) : 0x20;
+        }
+
+        /* aircraft type code (4 chars, e.g. "B738", scrn code) */
+        sprintf(j_ptr, "/ac/%d/t", i);
+        if (!j_str(ch, j_ptr, j_val, JVAL_SZ)) {
+            for (j = 0; j < 4; ++j) r[14 + j] = 0x20;
+        } else {
+            for (j = 0; j < 4; ++j)
+                r[14 + j] = j_val[j] ? asc2sc(j_val[j]) : 0x20;
+        }
+
+        /* altitude text (5 bytes, screen-coded) */
+        for (j = 0; j < 5; ++j)
+            r[18 + j] = asc2sc(alt_str[j]);
+
+        /* ground speed text (4 bytes, screen-coded) */
+        for (j = 0; j < 4; ++j)
+            r[23 + j] = asc2sc(gs_str[j]);
+
+        r[27] = 0;                       /* pad byte */
+        ++valid_count;
+    }
+
+    blob[4] = valid_count;
+
+    cbm_close(ch);
+
     if (!link_down_displayed) render_targets();
-    return (blob[3] & 0x01) ? ST_STALE : ST_OK;
+    return ST_OK;
 }
 
 #ifndef HOST_TEST
@@ -859,7 +943,7 @@ static void init_text_video(void)
     POKE(0xD011, 0x1B);
     POKE(0xD016, 0xC8);
     POKE(0xDD00, (PEEK(0xDD00) & 0xFC) | 0x03);
-    POKE(0xD018, 0x17);                           /* lowercase/uppercase ROM */
+    POKE(0xD018, 0x17);
     POKE(0xD020, 0); POKE(0xD021, 0);
 }
 
@@ -867,7 +951,6 @@ static void init_text_video(void)
 
 int main(void)
 {
-    init_config();
     copy_charset();
     for (;;) {
         unsigned char status;

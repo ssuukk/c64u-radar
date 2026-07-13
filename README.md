@@ -1,119 +1,117 @@
 # C64U Radar
 
-**v0.1 — first public beta.** A live ADS-B air traffic scope for the
-Commodore 64 Ultimate (C64U/Ultimate 64).
+A **Commodore 64** live radar scope for **ADS-B air traffic**, powered by
+[adsb.fi OpenData](https://github.com/adsbfi/opendata).
+
+**No PC server needed** — the C64 talks directly to adsb.fi over HTTPS
+using a **Meatloaf** IEC device with its built-in HTTP client and JSON
+Pointer extraction.  The Python bridge server and Ultimate-II+ UCI
+register interface have been eliminated.
 
 ![C64U Radar scope screen](assets/scope_preview.png)
 
-The C64 can't do HTTPS, JSON, or geodesic math, so a small companion program
-does that on a Mac, Windows, Linux, or Raspberry Pi computer and streams a
-compact binary feed to the C64U over the LAN:
+## Hardware requirements
+
+| Component | Requirement |
+|-----------|-------------|
+| **Commodore 64** | Any PAL or NTSC C64 (no Ultimate Cartridge needed) |
+| **IEC device** | Meatloaf (or compatible) with full-mode HTTP + TLS firmware |
+| **Network** | Ethernet (via Meatloaf) with internet access |
+
+## How it works
 
 ```text
-adsb.fi HTTPS API
-        |
-        v
-Python server: fetch, cache, filter, sort, project, encode
-        |
-        | plain TCP port 6464, MR2 request + LD binary response
-        v
-C64 Ultimate: validate feed, draw bitmap scope/table, move 8 sprites
+adsb.fi OpenData API (HTTPS)
+    ↑ /v3/lat/{lat}/lon/{lon}/dist/{dist}
+    |
+Meatloaf (IEC device #8, sec addr 2, full-mode HTTP)
+    ↑ cbm_open / cbm_write / cbm_read (JSON Pointer queries)
+    |
+C64U Radar (c64u_radar.prg)
+    ↓
+VIC-II hires bitmap scope + 8 hardware sprites
 ```
 
-The server uses only the Python standard library — no API key, no
-third-party package, no account.
-
-## Features
-
-- Hires bitmap scope, 9 nautical mile range with 3/6/9 nm rings.
-- Up to 8 simultaneous targets (VIC-II hardware sprite limit), shown as
-  numbered diamonds with a directional stem for track/heading.
-- Callsign, aircraft type, altitude, and groundspeed for each target.
-- Center on any latitude/longitude, or a four-letter ICAO airport code
-  (worldwide, via a cached OurAirports lookup).
-- The server finds the C64U on the LAN and pushes its own address into a
-  small mailbox in C64 memory over the C64 Ultimate's REST API — the server
-  address usually just fills itself in, with manual entry (`C= + S`) as a
-  fallback. See [`server/README.md`](server/README.md) for how this works.
+1. **Menu** — enter a latitude/longitude or a 4-letter ICAO airport code.
+   Airport codes resolve from a built-in table of ~280 major airports
+   (generated from the OurAirports database).
+2. **Fetch** — the C64 opens an HTTPS URL to adsb.fi v3 through Meatloaf.
+3. **Extract** — Meatloaf caches the JSON response; the C64 issues JSON
+   Pointer (`j`) queries for each aircraft's `dst`, `dir`, `track`,
+   `flight`, `t` (type), `alt_baro`, and `gs` — one field per query.
+4. **Project** — positions are converted to 0..199 pixel coords using
+   fixed-point sin/cos lookup tables (1° resolution, scaled by 127).
+5. **Display** — up to 8 targets as numbered diamond sprites with
+   direction stems on a 200×200 px radar scope, plus a side-panel table
+   of callsign, type, altitude, and ground speed.
 
 ## Quick start
 
-1. On a computer on the same LAN as the C64U, run the server:
-   - **macOS**: double-click `executables/server_bundle/start_server_mac.command`
-     (first launch needs a right-click → Open, since the script isn't
-     Apple-signed — see [`server/README.md`](server/README.md) for why).
-   - **Windows**: run `executables/server_bundle/start_server_windows.bat`.
-   - **Linux**: run `executables/server_bundle/start_server_mac_linux.sh`.
-   - Or directly: `python3 executables/server_bundle/ultimate_radar_server.py`
-     (Python 3.9+).
-2. On the C64U: enable `Command Interface`, then run `executables/c64u_radar.prg`.
-   Look under **Main Menu > MEMORY & ROMS** on the Commodore-branded C64
-   Ultimate, or **Configure > C64 and Cartridge Settings** on other
-   Ultimate 64 / 1541 Ultimate-II+ firmware. Menu location can vary by
-   firmware version; if you don't see it in one place, check the other.
-3. Pick a center (latitude/longitude or ICAO code). The server address should
-   already be filled in; if not, press `C= + S` to enter it manually.
+1. **On the C64**: load and run `c64u_radar.prg`.  No cartridge or
+   server setup is required — just Meatloaf on the IEC bus.
+2. **Pick a center**: choose latitude/longitude or a 4-letter ICAO
+   airport code.  The C64 fetches live traffic from adsb.fi directly.
 
-## Building from source
+## Build
 
-**C64 program** (needs [cc65](https://cc65.github.io/)):
+Requires [cc65](https://cc65.github.io/) on PATH.
 
 ```sh
 cd c64u_radar
 make clean all
 ```
 
-Fails the build if the program/data exceeds the fixed `$5A00` sprite memory
-block — this is checked automatically by `check_map.py`.
+Produces `c64u_radar.prg` (~19K) and `c64u_radar.map`.  The build fails
+if program/data exceeds the `$5A00` sprite memory block (checked by
+`check_map.py`).
 
-**Native logic harness** (no C64 emulator; compiles the real radar source
-against a fake 64K RAM and a mocked Ultimate network API, using your system's
-C compiler):
-
-```sh
-cd c64u_radar/host_test
-cc -DHOST_TEST -I. -I.. -o harness harness.c
-./harness
-```
-
-This is not a substitute for testing on real hardware, but it does catch
-regressions in request generation, PETSCII handling, the server-address
-mailbox, sprite drawing, and link-down behavior.
-
-**Server tests**:
+### Host-side test (no C64 needed)
 
 ```sh
-cd server
-python3 -m unittest test_ultimate_radar_server.py
+cd c64u_radar
+make host_test
+./host_test/harness
 ```
+
+Builds the same source natively against a fake 64K RAM plane and a mocked
+Meatloaf device.  Runs coordinate validation, airport lookup, sprite
+pattern, and link-down tests, then dumps binaries for preview renderers.
 
 ## Repository layout
 
 ```text
-c64u_radar/          C64 program source (cc65), Makefile, native test harness
-server/              Python server source and tests
-executables/          Prebuilt PRG and a ready-to-run server bundle
+c64u_radar/          C64 program source (cc65), Makefile, host-side tests
 assets/              Screenshots
 ```
 
-## Protocol summary
+## Memory map
 
-The C64 opens one TCP connection to the server on port 6464 per poll cycle
-(~10s), optionally sends an `MR2 POS <lat> <lon> <range>` or
-`MR2 ICAO <code> <range>` request line, reads an 8-byte header plus up to
-eight 28-byte aircraft records, then disconnects. See
-[`server/README.md`](server/README.md) for the full wire format and the HTTP
-debug endpoints (`/traffic.txt`, `/status.json`, etc.).
+```text
+$5A00  sprite patterns (512 bytes)
+$5C00  screen matrix (1000 color cells)
+$6000  bitmap (8000 bytes)
+$8000  charset copy (2048 bytes)
+$8800  rowbase table (100 bytes)
+$8900  blob buffer (232 bytes, LD wire format)
+$8A00  URL buffer (~72 bytes)
+$8A60  scope labels (28 bytes)
+$8A80  JSON Pointer buffer (~32 bytes)
+$8AC0  JSON value buffer (~36 bytes)
+```
+
+Program+data ends at `$53AA` — well below the `$5A00` sprite area.
+
+## Data source
+
+https://opendata.adsb.fi/ — public ADS-B data.  Personal non-commercial
+use.  Rate limit: 1 req/s (public tier); the C64 polls every ~10 s.
 
 ## Credits
 
 - Traffic data: [adsb.fi](https://adsb.fi/).
 - Airport coordinates: [OurAirports](https://ourairports.com/data/) (public domain).
-- C64 Ultimate command interface: the `ultimateii` library in
-  `c64u_radar/ultimateii/`, by Scott Hutter and Francesco Sblendorio
-  ([1541ultimate2](https://github.com/markusC64/1541ultimate2)), GPL-3.
+- Meatloaf IEC HTTP client: [meatloaf-dev](https://github.com/meatloaf-dev).
 
 ## License
 
-GPL-3. See [`LICENSE`](LICENSE). The C64 program links the GPL-3 `ultimateii`
-library directly, so the whole repository is distributed under those terms.
+GPL-3.0 — see LICENSE.
