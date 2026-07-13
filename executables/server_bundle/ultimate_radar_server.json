@@ -1,0 +1,16 @@
+{
+  "latitude": 0.0,
+  "longitude": 0.0,
+  "range_nm": 9,
+  "bind": "0.0.0.0",
+  "port": 6464,
+  "cache_seconds": 8,
+  "stale_after_seconds": 30,
+  "airport_cache_days": 30,
+  "timeout_seconds": 15,
+  "peek_seconds": 0.35,
+  "airports": {},
+  "ultimate_discovery": true,
+  "ultimate_hosts": [],
+  "ultimate_interval_seconds": 10
+}
