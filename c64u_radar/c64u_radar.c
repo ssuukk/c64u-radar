@@ -111,7 +111,7 @@ static char* const j_ptr = (char*)MEM(0x8A80);
 static char* const j_val = (char*)MEM(0x8AC0);
 
 /* Saved alt_baro raw string — survives intermediate j queries               */
-static char* const alt_raw = (char*)MEM(0x8AE0);
+static char* const alt_raw = (char*)MEM(0x8B00);
 
 static unsigned char link_down_displayed;
 static unsigned char current_range = DEFAULT_RANGE;
@@ -840,7 +840,7 @@ static unsigned char fetch(void)
         unsigned char* r = blob + 8 + (unsigned int)valid_count * REC_SZ;
 
         /* Filter: skip ground traffic (alt == "ground" or gs < 40 kt) */
-        sprintf(j_ptr, "/ac/%d/alt_baro", i);
+        sprintf(j_ptr, "/ac/%d/alt%cbaro", i, 0x5F);  /* %c emits raw _, avoids cc65 PETSCII */
         alt_raw[0] = 0;
         if (j_str(ch, j_ptr, j_val, JVAL_SZ))
             str_cpy(alt_raw, j_val, 16);   /* save for later display */
