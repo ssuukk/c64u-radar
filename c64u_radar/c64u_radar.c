@@ -110,6 +110,9 @@ static char* const scope_label2 = (char*)MEM(0x8A70);
 static char* const j_ptr = (char*)MEM(0x8A80);
 static char* const j_val = (char*)MEM(0x8AC0);
 
+/* Saved alt_baro raw string — survives intermediate j queries               */
+static char* const alt_raw = (char*)MEM(0x8AE0);
+
 static unsigned char link_down_displayed;
 static unsigned char current_range = DEFAULT_RANGE;
 
@@ -838,7 +841,10 @@ static unsigned char fetch(void)
 
         /* Filter: skip ground traffic (alt == "ground" or gs < 40 kt) */
         sprintf(j_ptr, "/ac/%d/alt_baro", i);
-        if (j_str(ch, j_ptr, j_val, JVAL_SZ) && is_ground(j_val))
+        alt_raw[0] = 0;
+        if (j_str(ch, j_ptr, j_val, JVAL_SZ))
+            str_cpy(alt_raw, j_val, 16);   /* save for later display */
+        if (alt_raw[0] && is_ground(alt_raw))
             continue;
         sprintf(j_ptr, "/ac/%d/gs", i);
         if (j_int(ch, j_ptr, &gs_val) && gs_val >= 0 && gs_val < 40)
@@ -883,17 +889,16 @@ static unsigned char fetch(void)
         r[5] = speed_byte;
         r[3] = flags;
 
-        /* Altitude text (fresh read) */
-        sprintf(j_ptr, "/ac/%d/alt_baro", i);
-        if (!j_str(ch, j_ptr, j_val, JVAL_SZ)) {
-            alt_str[0] = '-'; alt_str[1] = '-';
-            alt_str[2] = ' '; alt_str[3] = ' '; alt_str[4] = ' '; alt_str[5] = 0;
-        } else {
-            alt_val = atoi(j_val);
+        /* Altitude text (from saved alt_raw) */
+        if (alt_raw[0]) {
+            alt_val = atoi(alt_raw);
             if (alt_val >= 18000)
                 sprintf(alt_str, "FL%03d", alt_val / 100);
             else
                 sprintf(alt_str, "%5d", alt_val);
+        } else {
+            alt_str[0] = '-'; alt_str[1] = '-';
+            alt_str[2] = ' '; alt_str[3] = ' '; alt_str[4] = ' '; alt_str[5] = 0;
         }
         r[3] = flags;
 
