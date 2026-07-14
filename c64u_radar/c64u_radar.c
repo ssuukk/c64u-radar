@@ -836,64 +836,58 @@ static unsigned char fetch(void)
     for (i = 0; i < total; ++i) {
         unsigned char* r = blob + 8 + (unsigned int)valid_count * REC_SZ;
 
-        /* dst (nautical miles, in tenths) */
+        /* Filter: skip ground traffic (alt == "ground" or gs < 40 kt) */
+        sprintf(j_ptr, "/ac/%d/alt_baro", i);
+        if (j_str(ch, j_ptr, j_val, JVAL_SZ) && is_ground(j_val))
+            continue;
+        sprintf(j_ptr, "/ac/%d/gs", i);
+        if (j_int(ch, j_ptr, &gs_val) && gs_val >= 0 && gs_val < 40)
+            continue;
+
+        /* Distance from center (required for position) */
         sprintf(j_ptr, "/ac/%d/dst", i);
         if (!j_str(ch, j_ptr, j_val, JVAL_SZ) ||
             !parse_tenths(j_val, &dst_tenths)) {
-            continue;   /* skip missing/invalid aircraft */
+            continue;
         }
 
-        /* dir (bearing from center, degrees true) */
+        /* Bearing from center */
         sprintf(j_ptr, "/ac/%d/dir", i);
         if (!j_int(ch, j_ptr, &dir_int)) continue;
         dir_int %= 360;
         if (dir_int < 0) dir_int += 360;
 
-        /* project dst+dir to 0..199 pixel coordinates */
+        /* Project to pixel coords */
         project(dst_tenths, (unsigned int)dir_int, current_range, &px, &py);
-        r[0] = px;
-        r[1] = py;
-        r[2] = 3;                     /* blip color (reserved) */
-
+        r[0] = px; r[1] = py; r[2] = 3;
         flags = 0;
 
-        /* track heading (degrees, folded to 0..359) */
+        /* Track heading */
         sprintf(j_ptr, "/ac/%d/track", i);
         if (j_int(ch, j_ptr, &track_val)) {
             track_byte = (unsigned char)(((track_val % 360) * 256u) / 360);
         } else {
-            flags |= 0x04;
-            track_byte = 0;
+            flags |= 0x04; track_byte = 0;
         }
-        r[3] = flags;
-        r[4] = track_byte;
-        r[5] = 0;
+        r[3] = flags; r[4] = track_byte;
 
-        /* ground speed (knots, clamped to 0..255) */
-        sprintf(j_ptr, "/ac/%d/gs", i);
-        if (j_int(ch, j_ptr, &gs_val) && gs_val >= 0) {
+        /* Ground speed text */
+        if (gs_val >= 0) {
             speed_byte = (gs_val > 255) ? 255 : (unsigned char)gs_val;
             sprintf(gs_str, "%4d", (gs_val > 9999) ? 9999 : gs_val);
         } else {
-            flags |= 0x02;
-            speed_byte = 0;
+            flags |= 0x02; speed_byte = 0;
             gs_str[0] = '-'; gs_str[1] = '-';
-            gs_str[2] = ' '; gs_str[3] = ' ';
-            gs_str[4] = 0;
+            gs_str[2] = ' '; gs_str[3] = ' '; gs_str[4] = 0;
         }
         r[5] = speed_byte;
+        r[3] = flags;
 
-        /* altitude (feet, or "ground", or missing) */
+        /* Altitude text (fresh read) */
         sprintf(j_ptr, "/ac/%d/alt_baro", i);
         if (!j_str(ch, j_ptr, j_val, JVAL_SZ)) {
-            flags |= 0x01;
             alt_str[0] = '-'; alt_str[1] = '-';
-            alt_str[2] = ' '; alt_str[3] = ' ';
-            alt_str[4] = ' '; alt_str[5] = 0;
-        } else if (is_ground(j_val)) {
-            flags |= 0x01;
-            alt_str[0] = 'G'; alt_str[1] = 'N'; alt_str[2] = 'D';
-            alt_str[3] = ' '; alt_str[4] = ' '; alt_str[5] = 0;
+            alt_str[2] = ' '; alt_str[3] = ' '; alt_str[4] = ' '; alt_str[5] = 0;
         } else {
             alt_val = atoi(j_val);
             if (alt_val >= 18000)
