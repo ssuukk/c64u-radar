@@ -196,6 +196,7 @@ static unsigned char parse_tenths(const char* s, int* out)
     if (*s == '.') {
         ++s;
         if (*s >= '0' && *s <= '9') { frac = *s - '0'; ++s; }
+        while (*s >= '0' && *s <= '9') ++s;  /* consume rest of fraction */
     }
     if (*s) return 0;
     *out = sign * (val * 10 + frac);
@@ -216,19 +217,32 @@ static unsigned char is_ground(const char* s)
 /* Validate 4-letter ICAO code */ /* (basic range check — used at compile time) */
 static unsigned char is_icao(const char* code)
 {
-    unsigned char i;
-    for (i = 0; i < 4; ++i)
-        if (code[i] < 'A' || code[i] > 'Z') return 0;
+    unsigned char i, c;
+    for (i = 0; i < 4; ++i) {
+        c = (unsigned char)code[i];
+        /* Accept high PETSCII (0xC1-0xDA) or ASCII (0x41-0x5A) uppercase */
+        if ((c >= 0xC1 && c <= 0xDA) || (c >= 0x41 && c <= 0x5A))
+            continue;
+        return 0;
+    }
     return code[4] == 0;
 }
 
-/* Pack 4-char ICAO code into uint32 big-endian                             */
+/* Pack 4-char ICAO code into uint32 big-endian.
+ * Accepts high PETSCII bytes (0xC1-0xDA) or ASCII (0x41-0x5A).             */
 static unsigned long code_to_u32(const char* code)
 {
-    return ((unsigned long)(unsigned char)code[0] << 24) |
-           ((unsigned long)(unsigned char)code[1] << 16) |
-           ((unsigned long)(unsigned char)code[2] <<  8) |
-            (unsigned long)(unsigned char)code[3];
+    unsigned char b[4], c;
+    unsigned char i;
+    for (i = 0; i < 4; ++i) {
+        c = (unsigned char)code[i];
+        /* Normalize PETSCII → ASCII: 0xD0 (0x50|0x80) → 0x50, etc. */
+        b[i] = (c & 0x80) ? (c & 0x7F) : c;
+    }
+    return ((unsigned long)b[0] << 24) |
+           ((unsigned long)b[1] << 16) |
+           ((unsigned long)b[2] <<  8) |
+            (unsigned long)b[3];
 }
 
 /* Binary-search the airport table for an ICAO code.
@@ -812,9 +826,9 @@ static unsigned char fetch(void)
 
     blob[0] = MAGIC0; blob[1] = MAGIC1;
     blob[2] = 1;      /* wire version */
-    blob[3] = 0;      /* flags: 0x01=stale 0x02=truncated 0x04=loc_error */
+    blob[3] = (total > MAX_AC) ? 0x02 : 0;  /* truncated flag if >8 a/c  */
     blob[4] = 0;      /* count -- set after extraction */
-    blob[5] = 0;      /* total (unused without server) */
+    blob[5] = total > 255 ? 255 : (unsigned char)total;
     blob[6] = 0;      /* age */
     blob[7] = 0;
 
